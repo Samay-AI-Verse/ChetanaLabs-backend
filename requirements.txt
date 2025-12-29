@@ -1,0 +1,12 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+motor
+authlib
+itsdangerous
+httpx
+python-jose[cryptography]
+pandas
+pypdf
+groq
+requests
