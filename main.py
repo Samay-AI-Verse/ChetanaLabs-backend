@@ -736,19 +736,41 @@ async def get_live_activity(request: Request):
         
     return {"activity": candidates}
 
-# 3. ALL CANDIDATES LIST (For the Candidates Tab)
+# 3. ALL CANDIDATES LIST (For the Candidates Tab - with Campaign Names)
 @app.get("/api/candidates/all")
 async def get_all_candidates_list(request: Request):
     user = request.session.get('user')
     if not user: return {"candidates": []}
 
-    cursor = app.mongodb["candidates"].find({"user_id": user["google_id"]}).sort("created_at", -1)
+    # Fetch all candidates for this user
+    cursor = app.mongodb["candidates"].find({
+        "user_id": user["google_id"]
+    }).sort("created_at", -1)
+    
     candidates = []
+    
+    # Create a dictionary to cache campaign names (avoid multiple DB calls)
+    campaign_cache = {}
     
     async for doc in cursor:
         doc["id"] = str(doc.pop("_id"))
+        
         # Ensure a default status exists
-        if "status" not in doc: doc["status"] = "Not Contacted"
+        if "status" not in doc: 
+            doc["status"] = "Pending"
+        
+        # Fetch campaign name if not in cache
+        campaign_id = doc.get("campaign_id")
+        if campaign_id and campaign_id not in campaign_cache:
+            campaign = await app.mongodb["campaigns"].find_one(
+                {"_id": ObjectId(campaign_id)},
+                {"name": 1}
+            )
+            campaign_cache[campaign_id] = campaign.get("name", "Unknown Campaign") if campaign else "Unknown Campaign"
+        
+        # Add campaign name to candidate
+        doc["campaign_name"] = campaign_cache.get(campaign_id, "Unknown Campaign")
+        
         candidates.append(doc)
         
     return {"candidates": candidates}
@@ -759,15 +781,16 @@ async def get_all_candidates_list(request: Request):
 
 
 
+
+
 # ==========================================
-# 4. CAMPAIGN LAUNCHER (Receives IDs + Prompt)
+# 4. CAMPAIGN LAUNCHER (Updates Existing Campaign with Assistant Details)
 # ==========================================
 class CampaignLaunchRequest(BaseModel):
-    campaign_name: str
+    campaign_id: str  # Changed: Now requires existing campaign ID
     vapi_agent_id: str
     vapi_voice_id: str
     system_prompt: str
-    candidates: list = []
     strictness: str
     interview_mode: str
 
@@ -777,91 +800,165 @@ async def launch_campaign(request: CampaignLaunchRequest, req: Request):
     if not user:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    print(f"\n🚀 --- INITIATING CAMPAIGN: {request.campaign_name} ---")
+    # 1. Validate campaign exists and belongs to user
+    try:
+        campaign = await app.mongodb["campaigns"].find_one({
+            "_id": ObjectId(request.campaign_id),
+            "user_id": user['google_id']
+        })
+        
+        if not campaign:
+            raise HTTPException(status_code=404, detail="Campaign not found or access denied")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid campaign ID: {str(e)}")
+
+    campaign_name = campaign.get("name", "Unnamed Campaign")
+    
+    print(f"\n🚀 --- LAUNCHING CAMPAIGN: {campaign_name} ---")
+    print(f"📋 Campaign ID: {request.campaign_id}")
     print(f"👤 Agent ID: {request.vapi_agent_id}")
     print(f"🎙️ Voice ID: {request.vapi_voice_id}")
     print(f"🧠 System Prompt Length: {len(request.system_prompt)} chars")
-    print(f"👥 Candidates to Call: {len(request.candidates)}")
     
-    # 1. Create Campaign Record in MongoDB
-    new_campaign = {
-        "user_id": user['google_id'],
-        "name": request.campaign_name,
-        "status": "Active", # Set to Active immediately
-        "created_at": datetime.utcnow(),
-        "config": {
-            "agent_id": request.vapi_agent_id,
-            "voice_id": request.vapi_voice_id,
-            "prompt": request.system_prompt,
-            "strictness": request.strictness
-        },
-        "stats": {
-            "total": len(request.candidates),
-            "completed": 0,
-            "pending": len(request.candidates)
-        }
+    # 2. Update campaign with assistant details and change status to Active
+    update_data = {
+        "status": "Active",
+        "launched_at": datetime.utcnow().isoformat(),
+        "config.agent_id": request.vapi_agent_id,
+        "config.voice_id": request.vapi_voice_id,
+        "config.prompt": request.system_prompt,
+        "config.strictness": request.strictness,
+        "config.interview_mode": request.interview_mode
     }
     
-    result = await app.mongodb["campaigns"].insert_one(new_campaign)
-    campaign_id = str(result.inserted_id)
-
-    # 2. Add Candidates to Database (Linked to this Campaign)
-    if request.candidates:
-        candidate_docs = []
-        for cand in request.candidates:
-            candidate_docs.append({
-                "campaign_id": campaign_id,
-                "user_id": user['google_id'],
-                "name": cand.get("Name", "Unknown"),
-                "email": cand.get("Email", ""),
-                "phone": cand.get("Phone", ""),
-                "status": "Queued", # Ready to be called
-                "created_at": datetime.utcnow()
-            })
-        
-        if candidate_docs:
-            await app.mongodb["candidates"].insert_many(candidate_docs)
-
-    # 3. (FUTURE) TRIGGER VAPI CALL HERE
-    # In the future, you will loop through 'candidate_docs' here 
-    # and call the Vapi API using 'request.vapi_agent_id'
+    await app.mongodb["campaigns"].update_one(
+        {"_id": ObjectId(request.campaign_id)},
+        {"$set": update_data}
+    )
     
-    print(f"✅ Campaign {campaign_id} stored in DB.")
+    # Verify the update was successful
+    updated_campaign = await app.mongodb["campaigns"].find_one({"_id": ObjectId(request.campaign_id)})
+    print(f"✅ Campaign {request.campaign_id} updated with assistant details.")
+    print(f"🔍 VERIFIED Status in DB: {updated_campaign.get('status', 'NOT SET')}")
+    
+    # 3. Count candidates for this campaign
+    candidate_count = await app.mongodb["candidates"].count_documents({
+        "campaign_id": request.campaign_id
+    })
+    
+    print(f"👥 Total candidates: {candidate_count}")
+
+    # 4. (FUTURE) TRIGGER VAPI CALL HERE
+    # In the future, you will fetch candidates and initiate calls
+    # using 'request.vapi_agent_id' and 'request.vapi_voice_id'
+    
+    return {
+        "status": "success", 
+        "campaign_id": request.campaign_id,
+        "campaign_name": campaign_name,
+        "campaign_status": updated_campaign.get('status', 'Unknown'),  # Return actual status from DB
+        "candidate_count": candidate_count,
+        "message": f"Campaign '{campaign_name}' launched successfully with {candidate_count} candidates."
+    }
+
+
+# ==========================================
+# 4B. STOP CAMPAIGN (Pause/Stop Active Campaign)
+# ==========================================
+@app.post("/api/campaigns/{campaign_id}/stop")
+async def stop_campaign(campaign_id: str, req: Request):
+    user = req.session.get('user')
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    # 1. Validate campaign exists and belongs to user
+    try:
+        campaign = await app.mongodb["campaigns"].find_one({
+            "_id": ObjectId(campaign_id),
+            "user_id": user['google_id']
+        })
+        
+        if not campaign:
+            raise HTTPException(status_code=404, detail="Campaign not found or access denied")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid campaign ID: {str(e)}")
+
+    campaign_name = campaign.get("name", "Unnamed Campaign")
+    
+    print(f"\n⏸️ --- STOPPING CAMPAIGN: {campaign_name} ---")
+    print(f"📋 Campaign ID: {campaign_id}")
+    
+    # 2. Update campaign status to Stopped
+    await app.mongodb["campaigns"].update_one(
+        {"_id": ObjectId(campaign_id)},
+        {"$set": {
+            "status": "Stopped",
+            "stopped_at": datetime.utcnow().isoformat()
+        }}
+    )
+    
+    print(f"✅ Campaign {campaign_id} stopped successfully.")
 
     return {
         "status": "success", 
-        "campaign_id": campaign_id, 
-        "message": "Campaign initialized and candidates queued."
+        "campaign_id": campaign_id,
+        "campaign_name": campaign_name,
+        "message": f"Campaign '{campaign_name}' has been stopped."
     }
 
 
 # ==========================================
-# 5. DEBUG ENDPOINT (Check what was received)
+# 5. DEBUG ENDPOINT (Check Campaign Configuration)
 # ==========================================
-@app.get("/api/debug/latest-campaign")
-async def get_latest_campaign_debug():
+@app.get("/api/debug/campaign")
+async def get_campaign_debug(campaign_id: str = None, request: Request = None):
     """
-    Returns the raw configuration of the most recently launched campaign.
-    Use this to verify if the Frontend sent the correct Agent ID and Prompt.
+    Debug endpoint to inspect campaign configuration.
+    Usage: 
+    - /api/debug/campaign?campaign_id=<id>  -> Get specific campaign
+    - /api/debug/campaign                   -> Get latest campaign
     """
-    # 1. Fetch the last created campaign
-    latest_campaign = await app.mongodb["campaigns"].find_one(
-        sort=[("created_at", -1)] 
-    )
+    
+    if campaign_id:
+        # Fetch specific campaign by ID
+        try:
+            campaign = await app.mongodb["campaigns"].find_one(
+                {"_id": ObjectId(campaign_id)}
+            )
+            if not campaign:
+                return {"status": "error", "message": f"Campaign with ID '{campaign_id}' not found."}
+        except Exception as e:
+            return {"status": "error", "message": f"Invalid campaign ID: {str(e)}"}
+    else:
+        # Fetch the latest campaign
+        campaign = await app.mongodb["campaigns"].find_one(
+            sort=[("created_at", -1)]
+        )
+        
+        if not campaign:
+            return {"status": "No campaigns found in database."}
 
-    if not latest_campaign:
-        return {"status": "No campaigns found in database."}
+    # Count candidates for this campaign
+    campaign_id_str = str(campaign["_id"])
+    candidate_count = await app.mongodb["candidates"].count_documents({
+        "campaign_id": campaign_id_str
+    })
 
-    # 2. Return the config for inspection
+    # Build detailed response
     return {
-        "status": "Found Latest Campaign",
-        "campaign_name": latest_campaign.get("name"),
-        "received_config": {
-            "agent_id": latest_campaign["config"].get("agent_id"),
-            "voice_id": latest_campaign["config"].get("voice_id"),
-            "strictness": latest_campaign["config"].get("strictness"),
-            # Show first 100 chars of prompt to verify it exists
-            "system_prompt_preview": latest_campaign["config"].get("prompt", "")[:100] + "..."
-        },
-        "created_at": latest_campaign.get("created_at")
+        "status": "success",
+        "campaign_id": campaign_id_str,
+        "campaign_name": campaign.get("name", "Unnamed"),
+        "campaign_status": campaign.get("status", "Unknown"),
+        "created_at": campaign.get("created_at"),
+        "launched_at": campaign.get("launched_at", "Not launched yet"),
+        "candidate_count": candidate_count,
+        "configuration": {
+            "agent_id": campaign.get("config", {}).get("agent_id", "NOT SET"),
+            "voice_id": campaign.get("config", {}).get("voice_id", "NOT SET"),
+            "strictness": campaign.get("config", {}).get("strictness", "NOT SET"),
+            "interview_mode": campaign.get("config", {}).get("interview_mode", "NOT SET"),
+            "system_prompt_length": len(campaign.get("config", {}).get("prompt", "")) if campaign.get("config", {}).get("prompt") else 0,
+            "system_prompt_preview": (campaign.get("config", {}).get("prompt", "NOT SET")[:200] + "...") if campaign.get("config", {}).get("prompt") else "NOT SET"
+        }
     }
