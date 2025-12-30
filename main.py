@@ -12,7 +12,7 @@ from bson import ObjectId # Import ObjectId for explicit conversion
 import json
 from groq import Groq  # IMPORT GROQ
 from pydantic import BaseModel
-import requests  # For Vapi API calls
+
 # 1. Load Config
 load_dotenv()
 
@@ -401,35 +401,7 @@ groq_client = Groq(
     api_key=os.getenv("GROQ_API_KEY"),
 )
 
-# --- VAPI SETUP ---
-VAPI_API_KEY = os.getenv("VAPI_API_KEY")
-VAPI_PHONE_NUMBER_ID = os.getenv("VAPI_PHONE_NUMBER_ID")
-VAPI_BASE_URL = "https://api.vapi.ai"
 
-# Helper: Make Vapi API Requests
-def vapi_request(method: str, endpoint: str, data: dict = None):
-    """Helper function to make requests to Vapi API"""
-    headers = {
-        "Authorization": f"Bearer {VAPI_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    url = f"{VAPI_BASE_URL}{endpoint}"
-    
-    try:
-        if method == "GET":
-            response = requests.get(url, headers=headers)
-        elif method == "POST":
-            response = requests.post(url, headers=headers, json=data)
-        elif method == "DELETE":
-            response = requests.delete(url, headers=headers)
-        else:
-            raise ValueError(f"Unsupported HTTP method: {method}")
-        
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        print(f"Vapi API Error: {e}")
-        raise HTTPException(status_code=500, detail=f"Vapi API Error: {str(e)}")
 
 class BlueprintRequest(BaseModel):
     company_name: str
@@ -441,172 +413,115 @@ class BlueprintRequest(BaseModel):
     interview_mode: str
     duration: int
 
-# --- FIND THIS FUNCTION IN main.py AND REPLACE IT ---
-
 @app.post("/api/generate-blueprint")
 async def generate_blueprint_api(request: Request):
     try:
         data = await request.json()
-        
-        # --- 1. Parse & Sanitize Inputs ---
-        raw_duration = data.get('duration', 15)
-        if isinstance(raw_duration, str):
-            try:
-                duration = int(raw_duration.split()[0])
-            except:
-                duration = 15 
-        else:
-            duration = int(raw_duration)
 
-        # Calculate question count (approx 2.5 mins per question)
-        target_q_count = max(2, int((duration - 3) / 2.5)) 
+        # 1. Extract Data
+        company = data.get('company_name', 'TechCorp')
+        role = data.get('job_role', 'Candidate')
+        mode = data.get('interview_mode', 'Mixed')
+        strictness = data.get('strictness', 'Balanced')
         
-        # Parse fields
-        mode = data.get('interview_mode', 'Technical')
-        job_role = data.get('job_role', 'Candidate')
-        job_domain = data.get('job_domain', '')
-        tech_stack = data.get('tech_stack', '')
-        hr_focus = data.get('hr_focus', '')
+        # Deep Context
+        domain = data.get('domain', 'General')
+        tech_stack = data.get('tech_stack', 'General Skills')
+        hr_focus = data.get('hr_focus', 'Communication')
+        job_desc = data.get('job_description', '')
+        
+        # Agent Persona Settings
+        agent_name = data.get('agent_name', 'Interviewer')
+        language = data.get('language', 'English')
 
-        # --- 2. DEFINE "REAL HUMAN" PERSONA ---
-        # This logic changes HOW the AI speaks
-        
-        persona_instruction = ""
-        
-        if "HR" in mode:
-            persona_instruction = """
-            PERSONA IDENTITY: You are a warm, empathetic, and professional Senior HR Manager.
-            - TONE: Conversational, encouraging, and natural. Use fillers like "That's interesting" or "I see."
-            - BEHAVIOR: Do not simply ask list questions. If a candidate gives a short answer, probe deeper using the STAR method (Situation, Task, Action, Result).
-            - PRIORITY: Assess cultural fit, communication skills, and career motivations.
-            """
-        elif "Technical" in mode:
-            persona_instruction = """
-            PERSONA IDENTITY: You are a Senior Technical Lead / Engineering Manager.
-            - TONE: Professional, direct, analytical, and sharp.
-            - BEHAVIOR: Focus on 'How' and 'Why'. If they mention a technology, ask why they chose it over alternatives. Test their depth.
-            - PRIORITY: Verify actual hands-on expertise and problem-solving logic.
-            """
-        else: # Mixed
-            persona_instruction = """
-            PERSONA IDENTITY: You are a Hiring Manager looking for a well-rounded team member.
-            - TONE: Balanced and professional.
-            - BEHAVIOR: Switch naturally between discussing technical projects and team dynamics.
-            - PRIORITY: Assess both technical competence and team fit.
-            """
-
-        # --- 3. BUILD CONTEXT BLOCKS ---
-        
-        # A. Technical Context
-        tech_context_block = ""
-        if job_domain or tech_stack:
-            tech_context_block = f"""
-            [TECHNICAL DEPTH REQUIREMENTS]
-            - Domain: {job_domain}
-            - Core Stack: {tech_stack}
-            
-            INSTRUCTIONS:
-            1. Ask specific, scenario-based questions using {tech_stack}.
-            2. Avoid generic definitions (e.g., "What is React?"). Instead ask: "How have you handled state management scaling in React?"
-            """
-            
-            # Special Logic for Data Science (Mathematics)
-            if job_domain == "DataScience":
-                tech_context_block += """
-                3. REQUIRED: Include 1-2 questions testing Mathematical foundations (Statistics, Probability, or Linear Algebra) relevant to their ML models.
-                """
-            
-            # Special Logic for Backend/Fullstack (System Design)
-            if job_domain in ["Backend", "FullStack", "DevOps"]:
-                tech_context_block += """
-                3. REQUIRED: Include 1 question on System Design, Architecture, or Database Scaling.
-                """
-
-        # B. HR Context
-        hr_context_block = ""
-        if hr_focus:
-            hr_context_block = f"""
-            [HR EVALUATION CRITERIA]
-            - Focus Areas: {hr_focus}
-            
-            INSTRUCTIONS:
-            1. For each focus area, ask a behavioral question.
-            2. Example for 'Culture': "Describe a time you disagreed with a team member. How did you resolve it?"
-            """
-
-        # --- 4. CONSTRUCT FINAL SYSTEM PROMPT ---
-        system_instruction = f"""
-        {persona_instruction}
-        
-        JOB ROLE: {job_role} at {data.get('company_name')}.
-        JOB CONTEXT: {data.get('description')}
-        TOTAL DURATION: {duration} Minutes.
-        
-        {tech_context_block}
-        
-        {hr_context_block}
-        
-        TASK:
-        Generate a structured JSON Interview Blueprint.
-        The system_prompt within the JSON must force the AI Agent to adopt the Persona defined above.
-        
-        RESPONSE FORMAT (JSON ONLY):
-        {{
-            "system_prompt": "You are {data.get('agent_persona')}, a {job_role} recruiter at {data.get('company_name')}. {persona_instruction.replace(chr(10), ' ')} Your goal is to screen for: {tech_stack} {hr_focus}.",
-            "estimated_hours": "{round((data.get('candidate_count') * duration)/60, 1)}",
-            "phases": [
-                {{
-                    "name": "Introduction & Verification",
-                    "time_limit": "2 mins",
-                    "questions": [ 
-                        {{ "speaker": "AI", "text": "Hi, this is {data.get('agent_persona')} from {data.get('company_name')}. Thanks for taking the time. I'm reviewing your application for the {job_role} position. Is now a good time to chat?" }} 
-                    ]
-                }},
-                {{
-                    "name": "Core Interview",
-                    "time_limit": "{duration - 4} mins",
-                    "questions": [
-                         {{ "speaker": "AI", "text": "(Generate specific Question 1 based on Technical/HR context)" }},
-                         {{ "speaker": "AI", "text": "(Generate specific Question 2...)" }},
-                         {{ "speaker": "AI", "text": "(Generate specific Question 3...)" }}
-                    ]
-                }},
-                {{
-                    "name": "Closing",
-                    "time_limit": "1 min",
-                    "questions": [
-                        {{ "speaker": "AI", "text": "Thank you for sharing that. I have all I need for now. Our team will be in touch shortly regarding the next steps. Have a great day!" }}
-                    ]
-                }}
-            ]
-        }}
+        # 2. Build the "Persona Block" (Who is the AI?)
+        persona_prompt = f"""
+        IDENTITY: You are {agent_name}, a professional AI Recruiter for {company}.
+        ROLE: You are interviewing a candidate for the position of {role}.
+        LANGUAGE: Conduct the interview in {language}.
         """
 
-        # --- 5. Call Groq API ---
+        # 3. Build the "Behavior Block" based on Strictness
+        if "Strict" in strictness:
+            behavior_prompt = "BEHAVIOR: You are skeptical and rigorous. Do not accept vague answers. If the candidate mentions a keyword, ask 'Why?' or 'How?'. Drill down into specific implementation details. If they struggle, move on without helping."
+        elif "Friendly" in strictness:
+            behavior_prompt = "BEHAVIOR: You are warm, encouraging, and supportive. If the candidate struggles, offer a small hint. Focus on their potential rather than just right/wrong answers."
+        else: # Balanced
+            behavior_prompt = "BEHAVIOR: Be professional and neutral. Ask follow-up questions to verify depth, but keep the conversation moving smoothly. Use the STAR method to guide them."
+
+        # 4. Build the "Knowledge Base" (The System Problem/Context)
+        knowledge_prompt = ""
+        
+        if "Technical" in mode or "Mixed" in mode:
+            knowledge_prompt += f"""
+            TECHNICAL REQUIREMENTS:
+            - Domain: {domain}
+            - Required Stack: {tech_stack}
+            - Strategy: Ask scenario-based questions involving {tech_stack}. Avoid definition questions (e.g., "What is React?"). Instead ask: "How would you optimize a slow React render cycle?"
+            """
+            
+        if "HR" in mode or "Mixed" in mode:
+            knowledge_prompt += f"""
+            CULTURAL EVALUATION:
+            - Focus Areas: {hr_focus}
+            - Strategy: Ask behavioral questions. Example: "Tell me about a time you handled a conflict." Look for indicators of {hr_focus}.
+            """
+
+        # 5. Final Assembly for Vapi
+        system_prompt_for_vapi = f"""
+        {persona_prompt}
+        
+        {behavior_prompt}
+        
+        CONTEXT FROM JD:
+        {job_desc}
+        
+        {knowledge_prompt}
+        
+        INTERVIEW GUIDELINES:
+        1. Keep responses concise (under 2 sentences).
+        2. Wait for the user to finish speaking.
+        3. Do not Hallucinate skills the user does not have.
+        4. End the interview after gathering sufficient data.
+        """
+
+        # 6. Call Groq to structure the output JSON
+        # We ask Groq to format this into the JSON structure your UI expects
         chat_completion = groq_client.chat.completions.create(
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a JSON-only API. Output ONLY valid JSON."
+                    "content": "You are an API that generates interview blueprints. Output JSON only."
                 },
                 {
                     "role": "user",
-                    "content": system_instruction,
+                    "content": f"""
+                    Create a structured interview plan based on this system prompt:
+                    {system_prompt_for_vapi}
+                    
+                    The JSON must contain:
+                    1. "system_prompt": The exact text provided above (cleaned up).
+                    2. "phases": An array of 3 phases (Intro, Core, Closing).
+                    3. "estimated_duration": String.
+                    """
                 }
             ],
-            model="llama-3.3-70b-versatile", 
-            temperature=0.7, # Slightly higher for more creative/human-like questions
-            response_format={"type": "json_object"}, 
+            model="llama-3.3-70b-versatile",
+            temperature=0.6,
+            response_format={"type": "json_object"},
         )
 
         response_content = chat_completion.choices[0].message.content
         blueprint = json.loads(response_content)
+        
+        # Ensure the System Prompt is passed back exactly as we built it (Groq sometimes summarizes it)
+        blueprint["system_prompt"] = system_prompt_for_vapi
+
         return blueprint
 
     except Exception as e:
-        print(f"Groq API Error: {e}")
+        print(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/api/campaigns/{campaign_id}/save-final")
 async def save_final_campaign(campaign_id: str, request: Request):
@@ -840,403 +755,113 @@ async def get_all_candidates_list(request: Request):
 
 
 
-# ============================================
-# VAPI INTEGRATION ENDPOINTS
-# ============================================
 
-# 1. GET AVAILABLE VAPI ASSISTANTS
-@app.get("/api/vapi/assistants")
-async def get_vapi_assistants(request: Request):
-    """Fetch all available Vapi assistants from the user's Vapi account"""
-    user = request.session.get('user')
-    if not user: raise HTTPException(status_code=401, detail="Not logged in")
+
+
+
+# ==========================================
+# 4. CAMPAIGN LAUNCHER (Receives IDs + Prompt)
+# ==========================================
+class CampaignLaunchRequest(BaseModel):
+    campaign_name: str
+    vapi_agent_id: str
+    vapi_voice_id: str
+    system_prompt: str
+    candidates: list = []
+    strictness: str
+    interview_mode: str
+
+@app.post("/api/launch-campaign")
+async def launch_campaign(request: CampaignLaunchRequest, req: Request):
+    user = req.session.get('user')
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    print(f"\n🚀 --- INITIATING CAMPAIGN: {request.campaign_name} ---")
+    print(f"👤 Agent ID: {request.vapi_agent_id}")
+    print(f"🎙️ Voice ID: {request.vapi_voice_id}")
+    print(f"🧠 System Prompt Length: {len(request.system_prompt)} chars")
+    print(f"👥 Candidates to Call: {len(request.candidates)}")
     
-    if not VAPI_API_KEY:
-        # Return demo data if no API key configured
-        return {
-            "assistants": [
-                {"id": "demo_gpt4", "name": "GPT-4 Interviewer", "model": "gpt-4", "provider": "openai"},
-                {"id": "demo_claude", "name": "Claude Assistant", "model": "claude-3", "provider": "anthropic"},
-                {"id": "demo_llama", "name": "Llama 3 Agent", "model": "llama-3-70b", "provider": "groq"}
-            ]
+    # 1. Create Campaign Record in MongoDB
+    new_campaign = {
+        "user_id": user['google_id'],
+        "name": request.campaign_name,
+        "status": "Active", # Set to Active immediately
+        "created_at": datetime.utcnow(),
+        "config": {
+            "agent_id": request.vapi_agent_id,
+            "voice_id": request.vapi_voice_id,
+            "prompt": request.system_prompt,
+            "strictness": request.strictness
+        },
+        "stats": {
+            "total": len(request.candidates),
+            "completed": 0,
+            "pending": len(request.candidates)
         }
+    }
     
-    try:
-        data = vapi_request("GET", "/assistant")
-        return {"assistants": data}
-    except Exception as e:
-        print(f"Error fetching Vapi assistants: {e}")
-        return {"assistants": []}
+    result = await app.mongodb["campaigns"].insert_one(new_campaign)
+    campaign_id = str(result.inserted_id)
 
+    # 2. Add Candidates to Database (Linked to this Campaign)
+    if request.candidates:
+        candidate_docs = []
+        for cand in request.candidates:
+            candidate_docs.append({
+                "campaign_id": campaign_id,
+                "user_id": user['google_id'],
+                "name": cand.get("Name", "Unknown"),
+                "email": cand.get("Email", ""),
+                "phone": cand.get("Phone", ""),
+                "status": "Queued", # Ready to be called
+                "created_at": datetime.utcnow()
+            })
+        
+        if candidate_docs:
+            await app.mongodb["candidates"].insert_many(candidate_docs)
 
-# 2. GET AVAILABLE VOICE MODELS
-@app.get("/api/vapi/voices")
-async def get_vapi_voices(request: Request):
-    """Fetch all available voice models from Vapi"""
-    user = request.session.get('user')
-    if not user: raise HTTPException(status_code=401, detail="Not logged in")
+    # 3. (FUTURE) TRIGGER VAPI CALL HERE
+    # In the future, you will loop through 'candidate_docs' here 
+    # and call the Vapi API using 'request.vapi_agent_id'
     
-    # Return curated list of voices (Vapi supports multiple providers)
+    print(f"✅ Campaign {campaign_id} stored in DB.")
+
     return {
-        "voices": [
-            # 11Labs Voices
-            {"id": "21m00Tcm4TlvDq8ikWAM", "name": "Rachel (11Labs)", "provider": "11labs", "language": "en-US", "gender": "female"},
-            {"id": "AZnzlk1XvdvUeBnXmlld", "name": "Domi (11Labs)", "provider": "11labs", "language": "en-US", "gender": "female"},
-            {"id": "EXAVITQu4vr4xnSDxMaL", "name": "Bella (11Labs)", "provider": "11labs", "language": "en-US", "gender": "female"},
-            {"id": "ErXwobaYiN019PkySvjV", "name": "Antoni (11Labs)", "provider": "11labs", "language": "en-US", "gender": "male"},
-            {"id": "VR6AewLTigWG4xSOukaG", "name": "Arnold (11Labs)", "provider": "11labs", "language": "en-US", "gender": "male"},
-            
-            # PlayHT Voices
-            {"id": "s3://voice-cloning-zero-shot/d9ff78ba-d016-47f6-b0ef-dd630f59414e/female-cs/manifest.json", 
-             "name": "Jennifer (PlayHT)", "provider": "playht", "language": "en-US", "gender": "female"},
-            {"id": "larry", "name": "Larry (PlayHT)", "provider": "playht", "language": "en-US", "gender": "male"},
-            
-            # Azure Voices
-            {"id": "en-US-JennyNeural", "name": "Jenny (Azure)", "provider": "azure", "language": "en-US", "gender": "female"},
-            {"id": "en-US-GuyNeural", "name": "Guy (Azure)", "provider": "azure", "language": "en-US", "gender": "male"},
-        ]
+        "status": "success", 
+        "campaign_id": campaign_id, 
+        "message": "Campaign initialized and candidates queued."
     }
 
 
-# 3. CREATE VAPI ASSISTANT FROM CAMPAIGN
-@app.post("/api/vapi/create-assistant")
-async def create_vapi_assistant(request: Request):
-    """Create a Vapi assistant based on campaign configuration"""
-    user = request.session.get('user')
-    if not user: raise HTTPException(status_code=401, detail="Not logged in")
-    
-    data = await request.json()
-    campaign_id = data.get("campaign_id")
-    
-    if not campaign_id:
-        raise HTTPException(status_code=400, detail="campaign_id is required")
-    
-    # Fetch campaign from DB
-    campaign = await app.mongodb["campaigns"].find_one({"_id": ObjectId(campaign_id)})
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-    
-    # Get blueprint and config
-    blueprint = campaign.get("blueprint", {})
-    config = campaign.get("config", {})
-    
-    # Get selected voice and model from request
-    voice_id = data.get("voice_id", "21m00Tcm4TlvDq8ikWAM")  # Default: Rachel
-    voice_provider = data.get("voice_provider", "11labs")
-    model_provider = data.get("model_provider", "openai")
-    model_name = data.get("model_name", "gpt-4")
-    
-    # Build system prompt from blueprint or config
-    system_prompt = blueprint.get("system_prompt", f"""
-    You are a professional HR interviewer conducting a {config.get('mode', 'Technical')} interview 
-    for the position of {config.get('job_role', 'Candidate')} at {config.get('company_name', 'our company')}.
-    
-    Be conversational, professional, and engaging. Ask follow-up questions based on candidate responses.
-    """)
-    
-    # Prepare first message
-    first_message = f"Hi, thanks for taking the time to speak with me today. I'm calling regarding your application for the {config.get('job_role', 'position')} role at {config.get('company_name', 'our company')}. Is now a good time to chat?"
-    
-    if not VAPI_API_KEY:
-        # Demo mode: Just return a fake assistant ID
-        fake_assistant_id = f"demo_assistant_{campaign_id[:8]}"
-        await app.mongodb["campaigns"].update_one(
-            {"_id": ObjectId(campaign_id)},
-            {"$set": {
-                "vapi_assistant_id": fake_assistant_id,
-                "vapi_voice_id": voice_id,
-                "vapi_config": {
-                    "voice_provider": voice_provider,
-                    "model_provider": model_provider,
-                    "model_name": model_name
-                }
-            }}
-        )
-        return {
-            "status": "success",
-            "assistant_id": fake_assistant_id,
-            "message": "Demo mode: Assistant ID saved (Vapi API key not configured)"
-        }
-    
-    # Real Vapi API call
-    try:
-        assistant_data = {
-            "name": f"{campaign.get('name', 'Interview')} - AI Agent",
-            "model": {
-                "provider": model_provider,
-                "model": model_name,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                    }
-                ],
-                "temperature": 0.7
-            },
-            "voice": {
-                "provider": voice_provider,
-                "voiceId": voice_id
-            },
-            "firstMessage": first_message,
-            "endCallFunctionEnabled": True,
-            "recordingEnabled": True,
-            "analysisPlan": {
-                "summaryPrompt": "Provide a structured summary of the candidate's technical skills, communication ability, and overall suitability for the role.",
-                "structuredDataPrompt": "Extract: technical_skills (array), soft_skills (array), years_experience (number), recommendation (hire/maybe/pass)"
-            },
-            "serverUrl": f"{request.base_url}webhook/vapi/assistant-request",
-            "endCallMessage": "Thank you for your time. Our team will be in touch with you shortly regarding the next steps. Have a great day!"
-        }
-        
-        vapi_response = vapi_request("POST", "/assistant", assistant_data)
-        assistant_id = vapi_response.get("id")
-        
-        # Save assistant ID to campaign
-        await app.mongodb["campaigns"].update_one(
-            {"_id": ObjectId(campaign_id)},
-            {"$set": {
-                "vapi_assistant_id": assistant_id,
-                "vapi_voice_id": voice_id,
-                "vapi_config": {
-                    "voice_provider": voice_provider,
-                    "model_provider": model_provider,
-                    "model_name": model_name
-                },
-                "updated_at": datetime.utcnow().isoformat()
-            }}
-        )
-        
-        return {
-            "status": "success",
-            "assistant_id": assistant_id,
-            "message": "Vapi assistant created successfully"
-        }
-        
-    except Exception as e:
-        print(f"Error creating Vapi assistant: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to create assistant: {str(e)}")
-
-
-# 4. START CAMPAIGN CALLS
-@app.post("/api/vapi/start-campaign")
-async def start_campaign_calls(request: Request):
-    """Initiate outbound calls to all pending candidates in a campaign"""
-    user = request.session.get('user')
-    if not user: raise HTTPException(status_code=401, detail="Not logged in")
-    
-    data = await request.json()
-    campaign_id = data.get("campaign_id")
-    
-    if not campaign_id:
-        raise HTTPException(status_code=400, detail="campaign_id is required")
-    
-    # Fetch campaign
-    campaign = await app.mongodb["campaigns"].find_one({"_id": ObjectId(campaign_id)})
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-    
-    assistant_id = campaign.get("vapi_assistant_id")
-    if not assistant_id:
-        raise HTTPException(status_code=400, detail="No Vapi assistant configured. Create one first.")
-    
-    # Fetch pending candidates
-    candidates_cursor = app.mongodb["candidates"].find({
-        "campaign_id": campaign_id,
-        "status": {"$in": ["Pending", "Not Contacted"]}
-    })
-    
-    results = []
-    call_count = 0
-    
-    async for candidate in candidates_cursor:
-        phone = candidate.get("phone", "")
-        
-        # Basic phone validation
-        if not phone or len(phone) < 10:
-            results.append({
-                "candidate": candidate.get("name"),
-                "status": "skipped",
-                "reason": "Invalid phone number"
-            })
-            continue
-        
-        # Format phone to E.164 if needed (assuming US numbers for demo)
-        formatted_phone = phone if phone.startswith("+") else f"+1{phone.replace('-', '').replace(' ', '')}"
-        
-        if not VAPI_API_KEY or not VAPI_PHONE_NUMBER_ID:
-            # Demo mode: Just update status
-            await app.mongodb["candidates"].update_one(
-                {"_id": candidate["_id"]},
-                {"$set": {
-                    "status": "Scheduled (Demo)",
-                    "vapi_call_id": f"demo_call_{candidate['_id']}",
-                    "call_started_at": datetime.utcnow().isoformat()
-                }}
-            )
-            results.append({
-                "candidate": candidate.get("name"),
-                "status": "demo_scheduled",
-                "phone": formatted_phone
-            })
-            call_count += 1
-            continue
-        
-        # Real Vapi API call
-        try:
-            call_data = {
-                "assistantId": assistant_id,
-                "customer": {
-                    "number": formatted_phone,
-                    "name": candidate.get("name", "Candidate")
-                },
-                "phoneNumberId": VAPI_PHONE_NUMBER_ID
-            }
-            
-            vapi_response = vapi_request("POST", "/call/phone", call_data)
-            call_id = vapi_response.get("id")
-            
-            # Update candidate with call info
-            await app.mongodb["candidates"].update_one(
-                {"_id": candidate["_id"]},
-                {"$set": {
-                    "status": "In Progress",
-                    "vapi_call_id": call_id,
-                    "call_started_at": datetime.utcnow().isoformat()
-                }}
-            )
-            
-            results.append({
-                "candidate": candidate.get("name"),
-                "status": "call_initiated",
-                "call_id": call_id
-            })
-            call_count += 1
-            
-        except Exception as e:
-            print(f"Error initiating call for {candidate.get('name')}: {e}")
-            results.append({
-                "candidate": candidate.get("name"),
-                "status": "failed",
-                "error": str(e)
-            })
-    
-    # Update campaign status
-    await app.mongodb["campaigns"].update_one(
-        {"_id": ObjectId(campaign_id)},
-        {"$set": {
-            "status": "In Progress",
-            "calls_initiated": call_count,
-            "last_call_time": datetime.utcnow().isoformat()
-        }}
+# ==========================================
+# 5. DEBUG ENDPOINT (Check what was received)
+# ==========================================
+@app.get("/api/debug/latest-campaign")
+async def get_latest_campaign_debug():
+    """
+    Returns the raw configuration of the most recently launched campaign.
+    Use this to verify if the Frontend sent the correct Agent ID and Prompt.
+    """
+    # 1. Fetch the last created campaign
+    latest_campaign = await app.mongodb["campaigns"].find_one(
+        sort=[("created_at", -1)] 
     )
-    
+
+    if not latest_campaign:
+        return {"status": "No campaigns found in database."}
+
+    # 2. Return the config for inspection
     return {
-        "status": "success",
-        "total_calls": call_count,
-        "results": results
-    }
-
-
-# 5. WEBHOOK: CALL ENDED
-@app.post("/webhook/vapi/call-ended")
-async def vapi_call_ended_webhook(request: Request):
-    """Receive call completion data from Vapi"""
-    try:
-        payload = await request.json()
-        
-        # Extract call data
-        message = payload.get("message", {})
-        call = message.get("call", {})
-        call_id = call.get("id")
-        
-        if not call_id:
-            return {"status": "ignored", "reason": "No call ID"}
-        
-        # Find candidate by call_id
-        candidate = await app.mongodb["candidates"].find_one({"vapi_call_id": call_id})
-        
-        if not candidate:
-            print(f"Warning: No candidate found for call_id: {call_id}")
-            return {"status": "ignored", "reason": "Candidate not found"}
-        
-        # Extract call results
-        status = message.get("status", "ended")
-        transcript = message.get("transcript", "")
-        analysis = message.get("analysis", {})
-        duration = message.get("duration")  # in seconds
-        recording_url = message.get("recordingUrl", "")
-        
-        # Determine final status based on call outcome
-        final_status = "Completed"
-        if message.get("endedReason") == "customer-ended-call":
-            final_status = "Customer Ended"
-        elif message.get("endedReason") == "assistant-error":
-            final_status = "Failed"
-        
-        # Update candidate record
-        update_data = {
-            "status": final_status,
-            "call_ended_at": datetime.utcnow().isoformat(),
-            "call_transcript": transcript,
-            "call_analysis": analysis,
-            "call_recording_url": recording_url
-        }
-        
-        if duration:
-            update_data["call_duration"] = duration
-        
-        await app.mongodb["candidates"].update_one(
-            {"_id": candidate["_id"]},
-            {"$set": update_data}
-        )
-        
-        print(f"✅ Call completed for {candidate.get('name')} - Duration: {duration}s")
-        
-        return {"status": "received", "candidate": candidate.get("name")}
-        
-    except Exception as e:
-        print(f"Error processing webhook: {e}")
-        return {"status": "error", "message": str(e)}
-
-
-# 6. WEBHOOK: ASSISTANT REQUEST (for dynamic responses)
-@app.post("/webhook/vapi/assistant-request")
-async def vapi_assistant_request_webhook(request: Request):
-    """Handle dynamic assistant requests during calls"""
-    try:
-        payload = await request.json()
-        
-        # You can use this to customize responses mid-call
-        # For now, just acknowledge
-        return {
-            "status": "success",
-            "message": "Request received"
-        }
-        
-    except Exception as e:
-        print(f"Error in assistant request: {e}")
-        return {"status": "error"}
-
-
-# 7. GET CALL STATUS
-@app.get("/api/vapi/call-status/{call_id}")
-async def get_call_status(call_id: str, request: Request):
-    """Get real-time status of a specific call"""
-    user = request.session.get('user')
-    if not user: raise HTTPException(status_code=401)
-    
-    candidate = await app.mongodb["candidates"].find_one({"vapi_call_id": call_id})
-    
-    if not candidate:
-        raise HTTPException(status_code=404, detail="Call not found")
-    
-    return {
-        "call_id": call_id,
-        "candidate": candidate.get("name"),
-        "status": candidate.get("status"),
-        "started_at": candidate.get("call_started_at"),
-        "ended_at": candidate.get("call_ended_at"),
-        "duration": candidate.get("call_duration"),
-        "transcript": candidate.get("call_transcript", ""),
-        "analysis": candidate.get("call_analysis", {})
+        "status": "Found Latest Campaign",
+        "campaign_name": latest_campaign.get("name"),
+        "received_config": {
+            "agent_id": latest_campaign["config"].get("agent_id"),
+            "voice_id": latest_campaign["config"].get("voice_id"),
+            "strictness": latest_campaign["config"].get("strictness"),
+            # Show first 100 chars of prompt to verify it exists
+            "system_prompt_preview": latest_campaign["config"].get("prompt", "")[:100] + "..."
+        },
+        "created_at": latest_campaign.get("created_at")
     }
