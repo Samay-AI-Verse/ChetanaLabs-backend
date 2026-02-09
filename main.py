@@ -12,7 +12,10 @@ from bson import ObjectId # Import ObjectId for explicit conversion
 import json
 from groq import Groq  # IMPORT GROQ
 from pydantic import BaseModel
-
+from typing import Optional
+import random
+import asyncio  # For async delays
+import httpx # For Vapi API calls
 # 1. Load Config
 load_dotenv()
 
@@ -21,7 +24,7 @@ app = FastAPI()
 
 # Add Session Middleware (Required for OAuth)
 # WARNING: Ensure SECRET_KEY is set in your .env file
-app.add_middleware(SessionMiddleware, secret_key=os.getenv("SECRET_KEY"))
+app.add_middleware(SessionMiddleware, secret_key=os.getenv("SECRET_KEY"), https_only=False, same_site="lax")
 
 # 3. Path Setup (Connecting to your sibling Frontend folder)
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -104,7 +107,7 @@ async def auth_google_callback(request: Request):
         request.session['user'] = user_data
 
         # 4. Redirect to the Dashboard
-        return RedirectResponse(url='/dashboard')
+        return RedirectResponse(url='http://127.0.0.1:5173/dashboard')
 
     except OAuthError as e:
         return {"error": f"OAuth Error: {e.error}"}
@@ -162,7 +165,7 @@ async def create_new_campaign_api(request: Request):
             "mode": "Technical Round",
             "duration": "12 Mins",
             "script": "Initial script prompt...",
-            "voice": "Sarah",
+            "voice": "alloy-openai",
         }
     }
 
@@ -170,6 +173,7 @@ async def create_new_campaign_api(request: Request):
     result = await campaigns_collection.insert_one(new_campaign)
     
     new_campaign["_id"] = str(new_campaign["_id"]) 
+    new_campaign["id"] = new_campaign["_id"] # Fix: Ensure 'id' matches frontend expectation
 
     return {
         "message": "Campaign created successfully",
@@ -401,6 +405,16 @@ groq_client = Groq(
     api_key=os.getenv("GROQ_API_KEY"),
 )
 
+# --- VAPI CONFIGURATION ---
+# Initialize Vapi settings from environment
+VAPI_API_KEY = os.getenv("VAPI_API_KEY")
+VAPI_PHONE_NUMBER_ID = os.getenv("VAPI_PHONE_NUMBER_ID")
+
+if not VAPI_API_KEY:
+    print("⚠️ WARNING: VAPI_API_KEY not found in .env - Calling features will be disabled")
+if not VAPI_PHONE_NUMBER_ID:
+    print("⚠️ WARNING: VAPI_PHONE_NUMBER_ID not found in .env - Calling features will be disabled")
+
 
 
 class BlueprintRequest(BaseModel):
@@ -421,30 +435,27 @@ async def generate_blueprint_api(request: Request):
         # 1. Extract Data
         company = data.get('company_name', 'TechCorp')
         role = data.get('job_role', 'Candidate')
-        mode = data.get('interview_mode', 'Mixed')
+        mode = data.get('interview_mode', 'technical') # Default to technical
         strictness = data.get('strictness', 'Balanced')
         
         # Deep Context
-        domain = data.get('domain', 'General')
-        tech_stack = data.get('tech_stack', 'General Skills')
-        hr_focus = data.get('hr_focus', 'Communication')
-        job_desc = data.get('job_description', '')
+        professional_domains = data.get('professional_domains', []) # Array of domain IDs
+        evaluation_focus = data.get('evaluation_focus', []) # Array of focus IDs
+        job_desc = data.get('description', '')
         
         # Agent Persona Settings
-        agent_name = data.get('agent_name', 'Interviewer')
-        language = data.get('language', 'English')
-
+        agent_name = data.get('agent_persona', 'Interviewer')
+        
         # 2. Build the "Persona Block" (Who is the AI?)
         persona_prompt = f"""
         IDENTITY: You are {agent_name}, a professional AI Recruiter for {company}.
         ROLE: You are interviewing a candidate for the position of {role}.
-        LANGUAGE: Conduct the interview in {language}.
         """
 
         # 3. Build the "Behavior Block" based on Strictness
-        if "Strict" in strictness:
+        if "High" in strictness or "hard" in strictness.lower():
             behavior_prompt = "BEHAVIOR: You are skeptical and rigorous. Do not accept vague answers. If the candidate mentions a keyword, ask 'Why?' or 'How?'. Drill down into specific implementation details. If they struggle, move on without helping."
-        elif "Friendly" in strictness:
+        elif "Low" in strictness or "easy" in strictness.lower():
             behavior_prompt = "BEHAVIOR: You are warm, encouraging, and supportive. If the candidate struggles, offer a small hint. Focus on their potential rather than just right/wrong answers."
         else: # Balanced
             behavior_prompt = "BEHAVIOR: Be professional and neutral. Ask follow-up questions to verify depth, but keep the conversation moving smoothly. Use the STAR method to guide them."
@@ -452,19 +463,31 @@ async def generate_blueprint_api(request: Request):
         # 4. Build the "Knowledge Base" (The System Problem/Context)
         knowledge_prompt = ""
         
-        if "Technical" in mode or "Mixed" in mode:
-            knowledge_prompt += f"""
-            TECHNICAL REQUIREMENTS:
-            - Domain: {domain}
-            - Required Stack: {tech_stack}
-            - Strategy: Ask scenario-based questions involving {tech_stack}. Avoid definition questions (e.g., "What is React?"). Instead ask: "How would you optimize a slow React render cycle?"
+        # Domain Context
+        if professional_domains:
+            knowledge_prompt += f"\nPROFESSIONAL DOMAINS: {', '.join(professional_domains)}\n"
+            knowledge_prompt += "Focus your technical questions on these domains. Verify expertise in these specific areas.\n"
+
+        # Evaluation Focus
+        if evaluation_focus:
+            knowledge_prompt += f"\nEVALUATION FOCUS AREAS: {', '.join(evaluation_focus)}\n"
+            knowledge_prompt += "Prioritize evaluating the candidate on these specific soft skills and behavioral traits.\n"
+
+        # Mode Specifics
+        if mode == 'technical':
+            knowledge_prompt += """
+            TECHNICAL INTERVIEW STRATEGY:
+            - Ask scenario-based questions involving the professional domains.
+            - Avoid definition questions (e.g., "What is React?"). Instead ask: "How would you optimize a slow React render cycle?"
+            - Evaluate problem-solving skills and depth of knowledge.
             """
             
-        if "HR" in mode or "Mixed" in mode:
-            knowledge_prompt += f"""
-            CULTURAL EVALUATION:
-            - Focus Areas: {hr_focus}
-            - Strategy: Ask behavioral questions. Example: "Tell me about a time you handled a conflict." Look for indicators of {hr_focus}.
+        if mode == 'hr':
+            knowledge_prompt += """
+            HR INTERVIEW STRATEGY:
+            - Ask behavioral questions using the STAR method (Situation, Task, Action, Result).
+            - Focus on cultural fit, communication skills, and the selected evaluation focus areas.
+            - Example: "Tell me about a time you handled a conflict with a team member."
             """
 
         # 5. Final Assembly for Vapi
@@ -624,7 +647,43 @@ async def delete_campaign(campaign_id: str, request: Request):
 
     except Exception as e:
         print(f"Delete Error: {e}")
-        raise HTTPException(status_code=500, detail="Failed to delete campaign")
+
+@app.put("/api/campaigns/{campaign_id}")
+async def update_campaign(campaign_id: str, request: Request):
+    user = request.session.get('user')
+    if not user:
+        raise HTTPException(status_code=401, detail="Not logged in")
+
+    try:
+        data = await request.json()
+        
+        # Prepare update query
+        update_fields = {}
+        if "config" in data:
+            update_fields["config"] = data["config"]
+        if "status" in data:
+            update_fields["status"] = data["status"]
+        if "name" in data:
+            update_fields["name"] = data["name"]
+
+        if not update_fields:
+            return {"message": "No fields to update"}
+
+        from bson import ObjectId
+        result = await app.mongodb["campaigns"].update_one(
+            {"_id": ObjectId(campaign_id), "user_id": user["google_id"]},
+            {"$set": update_fields}
+        )
+        
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+
+        return {"status": "success", "message": "Campaign updated"}
+
+    except Exception as e:
+        print(f"Update Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 
 
@@ -776,6 +835,195 @@ async def get_all_candidates_list(request: Request):
     return {"candidates": candidates}
 
 
+# --- VAPI CALLING LOGIC ---
+
+@app.post("/api/launch-campaign")
+async def launch_campaign(request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    
+    try:
+        data = await request.json()
+        campaign_id = data.get('campaign_id')
+        
+        # 1. Get Campaign & Candidates
+        db = app.mongodb
+        campaign = await db.campaigns.find_one({"_id": ObjectId(campaign_id)})
+        if not campaign: raise HTTPException(status_code=404, detail="Campaign not found")
+        
+        # Update status to "Running"
+        await db.campaigns.update_one(
+            {"_id": ObjectId(campaign_id)},
+            {"$set": {"status": "Running"}}
+        )
+        
+        # Get pending candidates
+        cursor = db.candidates.find({
+            "campaign_id": campaign_id,
+            "status": "Pending"
+        })
+        
+        candidates = await cursor.to_list(length=100) # Limit batch size
+        
+        # 2. Launch Calls (Background Task)
+        # We start calling immediately but return success to UI
+        asyncio.create_task(process_calls(campaign, candidates, data))
+        
+        return {"status": "success", "message": f"Started calling {len(candidates)} candidates"}
+        
+    except Exception as e:
+        print(f"Launch Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+async def process_calls(campaign, candidates, config):
+    """Handles the actual Vapi API calls"""
+    async with httpx.AsyncClient() as client:
+        # Use config passed from frontend or fallback to campaign config
+        system_prompt = config.get("system_prompt") or campaign.get("blueprint", {}).get("system_prompt", "You are a helpful interviewer.")
+        voice_id = config.get("vapi_voice_id") or campaign.get("config", {}).get("voice", "jennifer-playht")
+        
+        # Public URL for Webhook (Update this in production)
+        SERVER_URL = os.getenv("SERVER_URL") 
+        webhook_url = f"{SERVER_URL}/api/vapi-webhook" if SERVER_URL else None
+
+        for candidate in candidates:
+            # Check if campaign was stopped
+            current_camp = await app.mongodb.campaigns.find_one({"_id": campaign["_id"]})
+            if current_camp.get("status") != "Running":
+                print("Campaign stopped by user.")
+                break
+                
+            try:
+                # Phone formatting
+                raw_phone = str(candidate.get("phone", "")).strip()
+                if not raw_phone.startswith("+"):
+                    raw_phone = "+91" + raw_phone # Default to India for now
+                
+                # Prepare Vapi Payload
+                payload = {
+                    "phoneNumberId": VAPI_PHONE_NUMBER_ID,
+                    "customer": {
+                        "number": raw_phone,
+                        "name": candidate.get("name")
+                    },
+                    "assistant": {
+                        "firstMessage": f"Hello {candidate.get('name')}, I am calling from {campaign.get('config', {}).get('company', 'our company')}. Do you have a moment for a quick interview?",
+                        "model": {
+                            "provider": "openai",
+                            "model": "gpt-4",
+                            "messages": [
+                                {
+                                    "role": "system", 
+                                    "content": system_prompt
+                                }
+                            ]
+                        },
+                        "voice": voice_id,
+                        "recordingEnabled": True,
+                        "interruptionsEnabled": True,
+                        "endCallFunctionEnabled": True,
+                        "serverUrl": webhook_url # Receive end-of-call report
+                    }
+                }
+                
+                # Make Call
+                headers = {
+                    "Authorization": f"Bearer {VAPI_API_KEY}",
+                    "Content-Type": "application/json"
+                }
+                
+                response = await client.post("https://api.vapi.ai/call", json=payload, headers=headers)
+                
+                if response.status_code == 201:
+                    call_data = response.json()
+                    call_id = call_data.get("id")
+                    
+                    # Update Candidate Status
+                    await app.mongodb.candidates.update_one(
+                        {"_id": candidate["_id"]},
+                        {"$set": {
+                            "status": "Dialing", 
+                            "call_id": call_id,
+                            "last_called": datetime.utcnow().isoformat()
+                        }}
+                    )
+                    print(f"✅ Call queued for {candidate.get('name')} ({call_id})")
+                else:
+                    print(f"❌ Vapi Error for {candidate.get('name')}: {response.text}")
+                    # Mark as Failed
+                    await app.mongodb.candidates.update_one(
+                        {"_id": candidate["_id"]},
+                        {"$set": {"status": "Failed"}}
+                    )
+
+            except Exception as e:
+                print(f"Call Exception: {e}")
+            
+            # Respect rate limits / pacing
+            await asyncio.sleep(2) 
+
+@app.post("/api/stop-campaign")
+async def stop_campaign(request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    
+    try:
+        data = await request.json()
+        campaign_id = data.get('campaign_id')
+        
+        # 1. Update Status
+        await app.mongodb.campaigns.update_one(
+            {"_id": ObjectId(campaign_id)},
+            {"$set": {"status": "Stopped"}}
+        )
+        
+        return {"status": "success", "message": "Campaign stopped"}
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# --- WEBHOOK FOR REPORTING ---
+@app.post("/api/vapi-webhook")
+async def vapi_webhook(request: Request):
+    """Receives End-of-Call Report from Vapi"""
+    try:
+        data = await request.json()
+        message_type = data.get("message", {}).get("type") or data.get("type")
+        
+        if message_type == "end-of-call-report":
+            call_id = data.get("call", {}).get("id")
+            analysis = data.get("analysis", {})
+            transcript = data.get("transcript", "")
+            summary = data.get("summary", "")
+            recording_url = data.get("recordingUrl", "")
+            
+            # Find candidate by call_id
+            candidate = await app.mongodb.candidates.find_one({"call_id": call_id})
+            
+            if candidate:
+                # Update Candidate with Report
+                await app.mongodb.candidates.update_one(
+                    {"_id": candidate["_id"]},
+                    {"$set": {
+                        "status": "Completed",
+                        "report": {
+                            "summary": summary,
+                            "transcript": transcript,
+                            "recording_url": recording_url,
+                            "analysis": analysis,
+                            "generated_at": datetime.utcnow().isoformat()
+                        }
+                    }}
+                )
+                print(f"📄 Report saved for candidate {candidate.get('name')}")
+                
+        return {"status": "success"}
+        
+    except Exception as e:
+        print(f"Webhook Error: {e}")
+        return {"status": "error", "detail": str(e)}
+
+
 
 
 
@@ -786,6 +1034,48 @@ async def get_all_candidates_list(request: Request):
 # ==========================================
 # 4. CAMPAIGN LAUNCHER (Updates Existing Campaign with Assistant Details)
 # ==========================================
+
+# --- NEW PUT ENDPOINT FOR CAMPAIGN UPDATES ---
+class UpdateCampaignRequest(BaseModel):
+    config: Optional[dict] = None
+    status: Optional[str] = None
+    name: Optional[str] = None
+
+@app.put("/api/campaigns/{campaign_id}")
+async def update_campaign(campaign_id: str, request: UpdateCampaignRequest, req: Request):
+    user = req.session.get('user')
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    try:
+        from bson import ObjectId
+        query = {"_id": ObjectId(campaign_id), "user_id": user['google_id']}
+        
+        # Prepare update data
+        update_doc = {"$set": {}}
+        if request.config:
+            update_doc["$set"]["config"] = request.config
+        if request.status:
+            print(f"Update Status: {request.status} for {campaign_id}")
+            update_doc["$set"]["status"] = request.status
+        if request.name:
+             update_doc["$set"]["name"] = request.name
+             
+        update_doc["$set"]["updated_at"] = datetime.utcnow().isoformat()
+
+        if not update_doc["$set"]:
+             return {"message": "No changes provided"}
+
+        result = await app.mongodb["campaigns"].update_one(query, update_doc)
+
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        
+        return {"status": "success", "message": "Campaign updated"}
+    except Exception as e:
+        print(f"Update Campaign Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 class CampaignLaunchRequest(BaseModel):
     campaign_id: str  # Changed: Now requires existing campaign ID
     vapi_agent_id: str
@@ -841,24 +1131,107 @@ async def launch_campaign(request: CampaignLaunchRequest, req: Request):
     print(f"✅ Campaign {request.campaign_id} updated with assistant details.")
     print(f"🔍 VERIFIED Status in DB: {updated_campaign.get('status', 'NOT SET')}")
     
-    # 3. Count candidates for this campaign
-    candidate_count = await app.mongodb["candidates"].count_documents({
+    # 3. Fetch all candidates for this campaign
+    candidates_cursor = app.mongodb["candidates"].find({
         "campaign_id": request.campaign_id
     })
     
+    candidates = []
+    async for doc in candidates_cursor:
+        candidates.append(doc)
+    
+    candidate_count = len(candidates)
     print(f"👥 Total candidates: {candidate_count}")
 
-    # 4. (FUTURE) TRIGGER VAPI CALL HERE
-    # In the future, you will fetch candidates and initiate calls
-    # using 'request.vapi_agent_id' and 'request.vapi_voice_id'
+    # 4. Check if Vapi is configured
+    if not VAPI_API_KEY or not VAPI_PHONE_NUMBER_ID:
+        print("⚠️ Vapi not configured - skipping actual calls")
+        return {
+            "status": "success", 
+            "campaign_id": request.campaign_id,
+            "campaign_name": campaign_name,
+            "campaign_status": updated_campaign.get('status', 'Unknown'),
+            "candidate_count": candidate_count,
+            "calls_initiated": 0,
+            "message": f"Campaign '{campaign_name}' launched (Vapi not configured - no calls made)."
+        }
+    
+    # 5. Make Vapi calls to all candidates
+    print(f"\n📞 --- INITIATING CALLS TO {candidate_count} CANDIDATES ---")
+    
+    calls_initiated = 0
+    calls_failed = 0
+    
+    for idx, candidate in enumerate(candidates, 1):
+        candidate_id = str(candidate["_id"])
+        candidate_name = candidate.get("name", "Unknown")
+        candidate_phone = candidate.get("phone", "")
+        
+        if not candidate_phone:
+            print(f"  ⏭️ Skipping {candidate_name} - No phone number")
+            calls_failed += 1
+            continue
+        
+        print(f"\n  📞 [{idx}/{candidate_count}] Calling {candidate_name} at {candidate_phone}...")
+        
+        # Make the call using Vapi helper
+        call_result = vapi_helper.make_outbound_call(
+            phone_number=candidate_phone,
+            assistant_id=request.vapi_agent_id,
+            voice_id=request.vapi_voice_id,
+            system_prompt=request.system_prompt,
+            phone_number_id=VAPI_PHONE_NUMBER_ID,
+            api_key=VAPI_API_KEY,
+            use_transient=False  # Use pre-created assistant
+        )
+        
+        if call_result["success"]:
+            # Update candidate with call information
+            await app.mongodb["candidates"].update_one(
+                {"_id": ObjectId(candidate_id)},
+                {"$set": {
+                    "vapi_call_id": call_result["call_id"],
+                    "vapi_assistant_id": request.vapi_agent_id,
+                    "vapi_voice_id": request.vapi_voice_id,
+                    "call_status": call_result["status"],
+                    "call_timestamp": datetime.utcnow().isoformat(),
+                    "status": "In Progress"
+                }}
+            )
+            
+            print(f"  ✅ Call initiated successfully - Call ID: {call_result['call_id']}")
+            calls_initiated += 1
+        else:
+            # Log the error
+            await app.mongodb["candidates"].update_one(
+                {"_id": ObjectId(candidate_id)},
+                {"$set": {
+                    "call_status": "failed",
+                    "call_error": call_result.get("error", "Unknown error"),
+                    "call_timestamp": datetime.utcnow().isoformat()
+                }}
+            )
+            
+            print(f"  ❌ Call failed: {call_result.get('error', 'Unknown error')}")
+            calls_failed += 1
+        
+        # Add small delay to avoid rate limiting (500ms)
+        if idx < candidate_count:
+            await asyncio.sleep(0.5)
+    
+    print(f"\n✅ --- CAMPAIGN LAUNCH COMPLETE ---")
+    print(f"  📊 Calls Initiated: {calls_initiated}/{candidate_count}")
+    print(f"  ❌ Calls Failed: {calls_failed}/{candidate_count}")
     
     return {
         "status": "success", 
         "campaign_id": request.campaign_id,
         "campaign_name": campaign_name,
-        "campaign_status": updated_campaign.get('status', 'Unknown'),  # Return actual status from DB
+        "campaign_status": updated_campaign.get('status', 'Unknown'),
         "candidate_count": candidate_count,
-        "message": f"Campaign '{campaign_name}' launched successfully with {candidate_count} candidates."
+        "calls_initiated": calls_initiated,
+        "calls_failed": calls_failed,
+        "message": f"Campaign '{campaign_name}' launched successfully. {calls_initiated} calls initiated, {calls_failed} failed."
     }
 
 
@@ -905,6 +1278,185 @@ async def stop_campaign(campaign_id: str, req: Request):
         "campaign_name": campaign_name,
         "message": f"Campaign '{campaign_name}' has been stopped."
     }
+
+
+# ==========================================
+# 4C. MANUAL CALL ENDPOINT
+# ==========================================
+class ManualCallRequest(BaseModel):
+    candidate_id: str
+    assistant_id: Optional[str] = None
+    voice_id: Optional[str] = None
+    phone_number: Optional[str] = None  # Override phone number if needed
+
+@app.post("/api/manual-call")
+async def make_manual_call(request: ManualCallRequest, req: Request):
+    """
+    Make a manual call to a specific candidate.
+    Can override assistant_id, voice_id, or phone_number.
+    """
+    user = req.session.get('user')
+    if not user:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    # Check Vapi configuration
+    if not VAPI_API_KEY or not VAPI_PHONE_NUMBER_ID:
+        raise HTTPException(status_code=503, detail="Vapi is not configured. Please add VAPI_API_KEY and VAPI_PHONE_NUMBER_ID to .env")
+    
+    # Fetch candidate
+    try:
+        candidate = await app.mongodb["candidates"].find_one({
+            "_id": ObjectId(request.candidate_id),
+            "user_id": user['google_id']
+        })
+        
+        if not candidate:
+            raise HTTPException(status_code=404, detail="Candidate not found or access denied")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid candidate ID: {str(e)}")
+    
+    # Get campaign to fetch default assistant_id and voice_id if not provided
+    campaign_id = candidate.get("campaign_id")
+    campaign = await app.mongodb["campaigns"].find_one({"_id": ObjectId(campaign_id)})
+    
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    
+    # Use provided values or fall back to campaign defaults
+    assistant_id = request.assistant_id or campaign.get("config", {}).get("agent_id")
+    voice_id = request.voice_id or campaign.get("config", {}).get("voice_id")
+    system_prompt = campaign.get("config", {}).get("prompt", "")
+    phone_number = request.phone_number or candidate.get("phone", "")
+    
+    if not phone_number:
+        raise HTTPException(status_code=400, detail="No phone number available for this candidate")
+    
+    if not assistant_id or not voice_id:
+        raise HTTPException(status_code=400, detail="Assistant ID or Voice ID not configured")
+    
+    print(f"\n📞 --- MANUAL CALL ---")
+    print(f"👤 Candidate: {candidate.get('name', 'Unknown')}")
+    print(f"📱 Phone: {phone_number}")
+    print(f"🤖 Assistant ID: {assistant_id}")
+    print(f"🎙️ Voice ID: {voice_id}")
+    
+    # Make the call
+    call_result = vapi_helper.make_outbound_call(
+        phone_number=phone_number,
+        assistant_id=assistant_id,
+        voice_id=voice_id,
+        system_prompt=system_prompt,
+        phone_number_id=VAPI_PHONE_NUMBER_ID,
+        api_key=VAPI_API_KEY,
+        use_transient=False
+    )
+    
+    if call_result["success"]:
+        # Update candidate with call information
+        await app.mongodb["candidates"].update_one(
+            {"_id": ObjectId(request.candidate_id)},
+            {"$set": {
+                "vapi_call_id": call_result["call_id"],
+                "vapi_assistant_id": assistant_id,
+                "vapi_voice_id": voice_id,
+                "call_status": call_result["status"],
+                "call_timestamp": datetime.utcnow().isoformat(),
+                "status": "In Progress"
+            }}
+        )
+        
+        print(f"✅ Call initiated successfully - Call ID: {call_result['call_id']}")
+        
+        return {
+            "success": True,
+            "message": "Call initiated successfully",
+            "call_id": call_result["call_id"],
+            "candidate_name": candidate.get("name", "Unknown"),
+            "phone_number": phone_number
+        }
+    else:
+        # Log the error
+        await app.mongodb["candidates"].update_one(
+            {"_id": ObjectId(request.candidate_id)},
+            {"$set": {
+                "call_status": "failed",
+                "call_error": call_result.get("error", "Unknown error"),
+                "call_timestamp": datetime.utcnow().isoformat()
+            }}
+        )
+        
+        print(f"❌ Call failed: {call_result.get('error', 'Unknown error')}")
+        
+        raise HTTPException(status_code=500, detail=call_result.get("error", "Failed to initiate call"))
+
+
+# ==========================================
+# 4D. VAPI WEBHOOK ENDPOINT
+# ==========================================
+@app.post("/api/vapi/webhook")
+async def vapi_webhook(request: Request):
+    """
+    Handle webhook callbacks from Vapi.
+    Updates candidate records with call status, transcript, and recording.
+    """
+    try:
+        payload = await request.json()
+        
+        # Parse webhook data
+        webhook_data = vapi_helper.parse_vapi_webhook(payload)
+        call_id = webhook_data.get("call_id", "")
+        
+        if not call_id:
+            print("⚠️ Webhook received but no call_id found")
+            return {"status": "error", "message": "No call_id in webhook"}
+        
+        print(f"\n📞 Vapi Webhook Received for Call ID: {call_id}")
+        print(f"  Status: {webhook_data.get('status', 'unknown')}")
+        print(f"  Duration: {webhook_data.get('duration', 0)}s")
+        
+        # Find candidate by vapi_call_id
+        candidate = await app.mongodb["candidates"].find_one({
+            "vapi_call_id": call_id
+        })
+        
+        if not candidate:
+            print(f"⚠️ No candidate found for call_id: {call_id}")
+            return {"status": "ok", "message": "Candidate not found"}
+        
+        # Update candidate with webhook data
+        update_data = {
+            "call_status": webhook_data.get("status", "unknown"),
+            "call_duration": webhook_data.get("duration", 0),
+            "call_recording_url": webhook_data.get("recording_url", ""),
+            "call_end_reason": webhook_data.get("end_reason", ""),
+            "updated_at": datetime.utcnow().isoformat()
+        }
+        
+        # If call is completed, update transcript
+        if webhook_data.get("transcript"):
+            update_data["call_transcript"] = webhook_data["transcript"]
+        
+        # Update candidate status based on call status
+        call_status = webhook_data.get("status", "")
+        if call_status == "ended":
+            # Call completed - keep current status or mark as completed
+            update_data["status"] = candidate.get("status", "Completed")
+        elif call_status in ["failed", "busy", "no-answer"]:
+            update_data["status"] = "Failed"
+            update_data["call_error"] = webhook_data.get("end_reason", "Call failed")
+        
+        await app.mongodb["candidates"].update_one(
+            {"_id": candidate["_id"]},
+            {"$set": update_data}
+        )
+        
+        print(f"✅ Updated candidate: {candidate.get('name', 'Unknown')}")
+        
+        return {"status": "ok", "message": "Webhook processed successfully"}
+        
+    except Exception as e:
+        print(f"❌ Error processing webhook: {str(e)}")
+        return {"status": "error", "message": str(e)}
 
 
 # ==========================================
@@ -962,3 +1514,365 @@ async def get_campaign_debug(campaign_id: str = None, request: Request = None):
             "system_prompt_preview": (campaign.get("config", {}).get("prompt", "NOT SET")[:200] + "...") if campaign.get("config", {}).get("prompt") else "NOT SET"
         }
     }
+
+# ==========================================
+# 6. CANDIDATE INTERVIEW REPORT ENDPOINT
+# ==========================================
+
+def generate_mock_interview_data(candidate_name: str, candidate_email: str, candidate_phone: str):
+    """Generate realistic mock interview data for testing"""
+    
+    # Generate random scores
+    overall_score = round(random.uniform(4.0, 9.5), 1)
+    confidence = round(random.uniform(5.0, 9.5), 1)
+    communication = round(random.uniform(5.0, 9.0), 1)
+    technical = round(random.uniform(4.0, 9.5), 1)
+    problem_solving = round(random.uniform(5.0, 9.0), 1)
+    cultural_fit = round(random.uniform(5.5, 9.0), 1)
+    
+    # Sample transcript based on score level
+    if overall_score >= 7.5:
+        transcript = [
+            {"timestamp": "00:00:05", "speaker": "AI", "text": f"Hello {candidate_name.split()[0]}, thank you for joining us today. Can you tell me about your experience with React?"},
+            {"timestamp": "00:00:12", "speaker": "Candidate", "text": "Yes, I have been working with React for about 3 years now. I've built several production applications using React with Redux for state management."},
+            {"timestamp": "00:00:28", "speaker": "AI", "text": "That's great. Can you walk me through a challenging problem you faced and how you solved it?"},
+            {"timestamp": "00:00:35", "speaker": "Candidate", "text": "Sure, we had a performance issue with our dashboard that was rendering thousands of rows. I implemented virtualization using react-window which reduced the render time from 8 seconds to under 1 second."},
+            {"timestamp": "00:01:05", "speaker": "AI", "text": "Excellent solution. How do you handle state management in large applications?"},
+            {"timestamp": "00:01:12", "speaker": "Candidate", "text": "I prefer using Redux Toolkit for complex state, but for simpler cases, I use Context API with useReducer. It really depends on the application's complexity."},
+            {"timestamp": "00:01:35", "speaker": "AI", "text": "How do you approach testing your React components?"},
+            {"timestamp": "00:01:42", "speaker": "Candidate", "text": "I use Jest and React Testing Library. I focus on testing user interactions rather than implementation details. We maintain about 80% test coverage."},
+        ]
+        strengths = [
+            "Strong technical foundation with 3+ years of React experience",
+            "Demonstrated problem-solving skills with concrete examples",
+            "Good understanding of performance optimization",
+            "Clear and articulate communication",
+            "Follows best practices in testing and state management"
+        ]
+        weaknesses = [
+            "Could improve knowledge of newer React features like Server Components",
+            "Limited experience with TypeScript mentioned"
+        ]
+        insights = "Excellent candidate with strong React expertise. Shows practical problem-solving ability and clear communication. Recommended for next round."
+    else:
+        transcript = [
+            {"timestamp": "00:00:05", "speaker": "AI", "text": f"Hello {candidate_name.split()[0]}, thank you for joining us. Can you tell me about your experience with React?"},
+            {"timestamp": "00:00:12", "speaker": "Candidate", "text": "Um, yes, I've used React. I learned it in a bootcamp last year."},
+            {"timestamp": "00:00:22", "speaker": "AI", "text": "Can you explain how React hooks work?"},
+            {"timestamp": "00:00:28", "speaker": "Candidate", "text": "Hooks are... um... functions that let you use state? Like useState and useEffect."},
+            {"timestamp": "00:00:40", "speaker": "AI", "text": "Can you give me an example of when you'd use useEffect?"},
+            {"timestamp": "00:00:48", "speaker": "Candidate", "text": "When you want to... fetch data? Or do something when the component loads."},
+            {"timestamp": "00:01:02", "speaker": "AI", "text": "How do you handle errors in your React applications?"},
+            {"timestamp": "00:01:10", "speaker": "Candidate", "text": "I use try-catch blocks. Sometimes console.log to check for errors."},
+        ]
+        strengths = [
+            "Shows basic understanding of React fundamentals",
+            "Willing to learn and improve",
+            "Polite and professional demeanor"
+        ]
+        weaknesses = [
+            "Limited practical experience with React",
+            "Struggles to articulate technical concepts clearly",
+            "Needs more hands-on project experience",
+            "Limited knowledge of advanced React patterns"
+        ]
+        insights = "Candidate has basic React knowledge but lacks depth. Would benefit from more practical experience before taking on senior roles."
+    
+    return {
+        "candidate": {
+            "name": candidate_name,
+            "email": candidate_email,
+            "phone": candidate_phone
+        },
+        "interview": {
+            "date": datetime.utcnow().isoformat(),
+            "duration": random.randint(480, 1200),  # 8-20 minutes in seconds
+            "status": "completed",
+            "recording_url": f"/recordings/interview_{random.randint(1000, 9999)}.mp3"
+        },
+        "transcript": transcript,
+        "scores": {
+            "overall": overall_score,
+            "confidence": confidence,
+            "communication": communication,
+            "technical_knowledge": technical,
+            "problem_solving": problem_solving,
+            "cultural_fit": cultural_fit
+        },
+        "analysis": {
+            "strengths": strengths,
+            "weaknesses": weaknesses,
+            "key_insights": insights,
+            "hesitation_count": random.randint(3, 15),
+            "filler_words_count": random.randint(5, 25),
+            "average_response_time": round(random.uniform(2.0, 5.5), 1)
+        }
+    }
+
+
+@app.get("/api/campaigns/{campaign_id}/candidate/{candidate_id}/report")
+async def get_candidate_interview_report(campaign_id: str, candidate_id: str, request: Request):
+    """
+    Get detailed interview report for a specific candidate.
+    Returns mock data for now - will be replaced with real interview data later.
+    """
+    user = request.session.get('user')
+    if not user:
+        raise HTTPException(status_code=401, detail="Not logged in")
+    
+    try:
+        # 1. Fetch candidate from database
+        candidate = await app.mongodb["candidates"].find_one({
+            "_id": ObjectId(candidate_id),
+            "campaign_id": campaign_id
+        })
+        
+        if not candidate:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+        
+        # 2. Check if real interview data exists (for future integration)
+        # For now, we'll always generate mock data
+        interview_results_coll = app.mongodb.get("interview_results")
+        if interview_results_coll:
+            interview_results = await interview_results_coll.find_one({
+                "candidate_id": candidate_id,
+                "campaign_id": campaign_id
+            })
+            
+            if interview_results:
+                # Return real interview data if it exists
+                interview_results["id"] = str(interview_results.pop("_id"))
+                return {"success": True, "data": interview_results}
+        
+        # Generate mock data for testing
+        mock_data = generate_mock_interview_data(
+            candidate.get("name", "Unknown Candidate"),
+            candidate.get("email", ""),
+            candidate.get("phone", "")
+        )
+        
+        return {"success": True, "data": mock_data}
+    
+    except Exception as e:
+        print(f"Error fetching interview report: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch interview report: {str(e)}")
+
+
+
+@app.get("/api/candidates/{candidate_id}/report")
+async def get_candidate_report(candidate_id: str, request: Request):
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+
+    try:
+        # 1. Fetch Candidate Basic Info
+        db = app.mongodb["candidates"]
+        candidate = await db.find_one({"_id": ObjectId(candidate_id)})
+        
+        if not candidate:
+            raise HTTPException(status_code=404, detail="Candidate not found")
+            
+        candidate["id"] = str(candidate.pop("_id"))
+
+        # 2. Generate MOCK Interview Data (Simulating the AI Engine result)
+        # In a real scenario, you would fetch this from an 'interviews' collection
+        
+        mock_scores = {
+            "confidence": random.randint(70, 98),
+            "communication": random.randint(65, 95),
+            "technical": random.randint(60, 92),
+            "cultural": random.randint(75, 99)
+        }
+        
+        # Calculate weighted average
+        total_score = int((mock_scores["confidence"] + mock_scores["communication"]*1.2 + mock_scores["technical"]*1.5 + mock_scores["cultural"]) / 4.7)
+
+        # 🎯 AUTO-SELECTION LOGIC: Based on AI Score
+        # Business Rule: Score >= 70 = Selected, < 70 = Rejected
+        auto_status = "Selected" if total_score >= 70 else "Rejected"
+        
+        # Update candidate status in database
+        await db.update_one(
+            {"_id": ObjectId(candidate_id)},
+            {"$set": {
+                "status": auto_status,
+                "ai_score": total_score,
+                "updated_at": datetime.utcnow().isoformat()
+            }}
+        )
+
+        mock_transcript = [
+            {"role": "ai", "text": "Hello, thank you for joining. Let's start with your experience in Python.", "time": "00:05"},
+            {"role": "user", "text": "Hi! Yes, I've been using Python for about 4 years now, mostly for backend development using FastAPI and Django.", "time": "00:12"},
+            {"role": "ai", "text": "That's great. Can you explain how you handle database migrations in a production environment?", "time": "00:25"},
+            {"role": "user", "text": "I usually stick to the standard ORM tools. For Django, I use manage.py migrate. However, for large datasets, I ensure to lock tables minimally or use tools like gh-ost if it's MySQL.", "time": "00:38"},
+            {"role": "ai", "text": "Excellent detailed answer. Now, tell me about a time you faced a difficult bug.", "time": "00:50"},
+            {"role": "user", "text": "We had a memory leak in one of our microservices. I used a profiler to trace it back to an unclosed file handler in a utility function.", "time": "01:15"},
+            {"role": "ai", "text": "Very impressive problem solving. One last question about cultural fit...", "time": "01:30"}
+        ]
+        
+        return {
+            "candidate": candidate,
+            "interview_data": {
+                "status": auto_status,
+                "duration": "14m 30s",
+                "date": datetime.utcnow().isoformat(),
+                "overall_score": total_score,
+                "scores": mock_scores,
+                "transcript": mock_transcript,
+                "summary": f"Candidate automatically {auto_status.lower()} based on AI score of {total_score}/100. " + 
+                          ("Strong technical knowledge and communication skills demonstrated." if auto_status == "Selected" else "Needs improvement in technical areas.")
+            }
+        }
+    except Exception as e:
+        print(f"Report Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# CSV EXPORT ENDPOINTS
+# ==========================================
+from fastapi.responses import StreamingResponse
+import csv
+from io import StringIO
+
+@app.get("/api/campaigns/{campaign_id}/export/all")
+async def export_all_candidates(campaign_id: str, request: Request):
+    """Export all candidates for a campaign as CSV"""
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    
+    try:
+        # Fetch all candidates for this campaign
+        db = app.mongodb["candidates"]
+        cursor = db.find({"campaign_id": campaign_id})
+        
+        # Create CSV in memory
+        output = StringIO()
+        writer = csv.writer(output)
+        
+        # Write headers
+        writer.writerow(["Name", "Email", "Phone", "Status", "AI Score", "Date Added"])
+        
+        # Write data rows
+        async for candidate in cursor:
+            writer.writerow([
+                candidate.get("name", ""),
+                candidate.get("email", ""),
+                candidate.get("phone", ""),
+                candidate.get("status", "Pending"),
+                candidate.get("ai_score", "N/A"),
+                candidate.get("created_at", "")[:10] if candidate.get("created_at") else ""
+            ])
+        
+        # Prepare response
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=all_candidates_{campaign_id}.csv"}
+        )
+        
+    except Exception as e:
+        print(f"Export Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/campaigns/{campaign_id}/export/selected")
+async def export_selected_candidates(campaign_id: str, request: Request):
+    """Export only selected candidates for a campaign as CSV"""
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    
+    try:
+        # Fetch only Selected candidates
+        db = app.mongodb["candidates"]
+        cursor = db.find({
+            "campaign_id": campaign_id,
+            "status": "Selected"
+        })
+        
+        # Create CSV in memory
+        output = StringIO()
+        writer = csv.writer(output)
+        
+        # Write headers
+        writer.writerow(["Name", "Email", "Phone", "AI Score", "Date Selected"])
+        
+        # Write data rows
+        async for candidate in cursor:
+            writer.writerow([
+                candidate.get("name", ""),
+                candidate.get("email", ""),
+                candidate.get("phone", ""),
+                candidate.get("ai_score", "N/A"),
+                candidate.get("updated_at", "")[:10] if candidate.get("updated_at") else ""
+            ])
+        
+        # Prepare response
+        output.seek(0)
+        return StreamingResponse(
+            iter([output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename=selected_candidates_{campaign_id}.csv"}
+        )
+        
+    except Exception as e:
+        print(f"Export Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# ==========================================
+# CAMPAIGN STATISTICS ENDPOINT
+# ==========================================
+
+@app.get("/api/campaigns/{campaign_id}/statistics")
+async def get_campaign_statistics(campaign_id: str, request: Request):
+    """Get real-time campaign statistics for performance dashboard"""
+    user = request.session.get('user')
+    if not user: raise HTTPException(status_code=401)
+    
+    try:
+        db = app.mongodb["candidates"]
+        
+        # Count candidates by status
+        total = await db.count_documents({"campaign_id": campaign_id})
+        selected = await db.count_documents({"campaign_id": campaign_id, "status": "Selected"})
+        rejected = await db.count_documents({"campaign_id": campaign_id, "status": "Rejected"})
+        pending = await db.count_documents({"campaign_id": campaign_id, "status": {"$in": ["Pending", "In Progress", "Scheduled"]}})
+        
+        # Calculate percentages for success rate analysis
+        selected_pct = round((selected / total * 100), 1) if total > 0 else 0
+        rejected_pct = round((rejected / total * 100), 1) if total > 0 else 0
+        pending_pct = round((pending / total * 100), 1) if total > 0 else 0
+        
+        # Calculate trend (comparing to previous period - mock for now)
+        # In production, you'd compare to last week's data
+        selected_trend = "+12%" if selected > 0 else "0%"
+        rejected_trend = "-5%" if rejected < pending else "+8%"
+        
+        return {
+            "total": total,
+            "selected": {
+                "count": selected,
+                "trend": selected_trend,
+                "percentage": selected_pct
+            },
+            "rejected": {
+                "count": rejected,
+                "trend": rejected_trend,
+                "percentage": rejected_pct
+            },
+            "pending": {
+                "count": pending,
+                "status": "Processing",
+                "percentage": pending_pct
+            },
+            "success_rate": {
+                "selected_percent": selected_pct,
+                "pending_percent": pending_pct,
+                "rejected_percent": rejected_pct
+            }
+        }
+        
+    except Exception as e:
+        print(f"Statistics Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
